@@ -1,86 +1,58 @@
 ﻿using System;
-using System.Diagnostics;
-using System.Configuration;
-using System.Linq;
+using System.Collections.Generic;
+using System.IO;
+using System.Security.Cryptography;
 using System.ServiceProcess;
-using System.Timers;
-using System.Text.RegularExpressions;
-using ActiveUp.Net.Mail;
-using TaskBeat.Bootstrapper;
-using TaskBeat.Logic;
-using TaskBeat.Logic.MailImporter;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Xml;
 using TaskBeat.Logic.Routines.Interfaces;
-using TaskBeat.Logic.Settings;
-using StructureMap;
-using TaskBeat.Logic.Tasks;
-using TaskBeat.Logic.Loggers;
-using TaskBeat.Logic.Cache;
-using TaskBeat.Logic.Helpers;
 
 namespace MailImporter
 {
     public partial class MailService : ServiceBase
     {
         // Schedule timer
-        private Timer checkerTimer { get; set; }
-        
-        private ISettings settings { get; set;}
+        private System.Timers.Timer checkerTimer { get; set; }
 
         // Comments routines
-        public ICommentsRoutines _commentsRoutines { get; set; }
-        
+        public static ICommentsRoutines _commentsRoutines { get; set; }
+
         // Task routines
-        public ITaskRoutines _taskRoutines { get; set; }
+        public static ITaskRoutines _taskRoutines { get; set; }
 
         // Profile routines
-        public IProfileRoutines _profileRoutines { get; set; }
+        public static IProfileRoutines _profileRoutines { get; set; }
 
-        // Logger
-        public ILogger Logger { get; set; }
+        // Task managing variables
+        private bool processing = false;
+        private readonly object processingLock = new object();
 
-        // Use SSL
-        public bool UseSsl;
+        // List of users
+        private readonly List<User> users = new List<User>();
 
-        // Mail client instance
-        public Imap4Client mailClient;
+        // SHA1 hash of the Users.xml file
+        private byte[] usersHash;
 
-        // Internal logger
-        private void WriteToEventLog(string message, EventLogEntryType type = EventLogEntryType.Information)
-        {
-            if (!EventLog.SourceExists("MailImporter"))
-                EventLog.CreateEventSource("MailImporter", "Application");
-
-            EventLog.WriteEntry("MailImporter", message, type);
-        }
+        // SHA1 instance for computing hashes
+        private readonly SHA1 sha1 = SHA1.Create();
 
         // Constructor
-        public MailService()
+        public MailService(ICommentsRoutines commentsRoutines, ITaskRoutines taskRoutines, IProfileRoutines profileRoutines)
         {
             try
             {
                 InitializeComponent();
 
-                settings = new Settings()
-                {
-                    CurrentCulture = "pl-PL",
-                    BinFolder = AppDomain.CurrentDomain.BaseDirectory,
-                    ConnectionString = DatabaseAccessor.Instance.GetConnectionString(),
-                    MailImporterMessageSeparator = GetConfigurationStringValue("MailImporterMessageSeparator", "--"),
-                    MailImporterTitleNewTag = GetConfigurationStringValue("MailTitleNewTag", "#new"),
-                    MailImporterProcessInterval = GetConfigurationIntegerValue("MailServerCheckerInterval")
-                };
+                _commentsRoutines = commentsRoutines;
+                _taskRoutines = taskRoutines;
+                _profileRoutines = profileRoutines;
 
-                if (!bool.TryParse(GetConfigurationStringValue("UseSsl", "false"), out UseSsl))
-                    UseSsl = false;
-
-                Bootstrapper.Register(settings);
-                ObjectFactory.BuildUp(this);
-
-                WriteToEventLog("Initialization succeeded!");
+                Logger.Log("Initialization succeeded!");
             }
-            catch (Exception ex)
+            catch(Exception ex)
             {
-                WriteToEventLog("Initialization failed: " + ex.Message, EventLogEntryType.Error);
+                Logger.Log($"Initialization failed: {ex.Message}", LogType.ERROR);
                 throw;
             }
         }
@@ -92,233 +64,177 @@ namespace MailImporter
 
         protected override void OnStart(string[] args)
         {
-            checkerTimer = new Timer { Interval = settings.MailImporterProcessInterval };
-            checkerTimer.Elapsed += SheduleTimerTick;
+            checkerTimer = new System.Timers.Timer(Config.GetValue("MailServerCheckerInterval", Default.MailImporterProcessInterval));
+            checkerTimer.Elapsed += ScheduleTimerTick;
             checkerTimer.Enabled = true;
         }
 
-        private void SheduleTimerTick(object sender, EventArgs e)
-        {            
-            try
+        private void ScheduleTimerTick(object sender, EventArgs e)
+        {
+            bool log = false;
+            lock(processingLock)
             {
-                checkerTimer.Enabled = false;
-                //Logger.LogInfo("MailImporter is Working...", LogType.Message);
-
-                ProcessMailMessages();
+                if (!processing)
+                {
+                    processing = true;
+                    Task.Run(() =>
+                    {
+                        LoadUsers();
+                        ProcessMailMessages();
+                        lock(processingLock)
+                        {
+                            processing = false;
+                        }
+                    }).ContinueWith(task =>
+                    {
+                        if(task.IsFaulted)
+                        {
+                            Logger.Log($"There was a problem with the task! {task?.Exception?.GetBaseException()?.Message ?? string.Empty}", LogType.ERROR);
+                            lock(processingLock)
+                            {
+                                processing = false; // If there was a problem with the task, it might not have set the processing to false
+                            }
+                        }
+                    });
+                }
+                else
+                {
+                    log = true;
+                }
             }
-            finally
-            {
-                checkerTimer.Enabled = true;
-            }                    
+            if (log) Logger.Log("Previous mail processing is not done yet. Skipping", LogType.WARNING);
         }
 
-        public void ProcessMailMessages()
-        {           
+        private void ProcessMailMessages()
+        {
+            ManualResetEvent[] doneEvents = new ManualResetEvent[users.Count];
+            CancellationTokenSource[] cancelTokens = new CancellationTokenSource[users.Count];
+            for(int i = 0; i < users.Count; i++)
+            {
+                doneEvents[i] = new ManualResetEvent(false);
+                cancelTokens[i] = new CancellationTokenSource();
+                MailProcessJob job = new MailProcessJob(users[i], doneEvents[i], cancelTokens[i].Token);
+                ThreadPool.QueueUserWorkItem(job.ProcessMail, i);
+            }
+
+            if (doneEvents.Length > 0)
+            {
+                bool completed = WaitHandle.WaitAll(doneEvents, Default.Timeout);
+                if (!completed) // Cancel the jobs
+                {
+                    foreach(CancellationTokenSource token in cancelTokens)
+                    {
+                        token.Cancel();
+                    }
+
+                    // Wait again for the cancellation to end
+                    WaitHandle.WaitAll(doneEvents);
+                }
+            }
+        }
+
+        private void LoadUsers()
+        {
+            FileStream usersFile = null;
             try
             {
-                if (mailClient == null || !mailClient.IsConnected)
-                {
-                    mailClient = new Imap4Client();
+                usersFile = new FileStream("Users.xml", FileMode.Open, FileAccess.Read);
+                if (usersFile.CanSeek) usersFile.Position = 0;
 
-                    if (UseSsl)
+                byte[] hash = sha1.ComputeHash(usersFile);
+                if (usersHash != hash)
+                {
+                    usersHash = hash;
+                }
+                else
+                {
+                    // The file has not changed since last check, no need to reload
+                    return;
+                }
+
+                foreach (User user in users)
+                {
+                    if (user.MailClient != null && user.MailClient.IsConnected)
                     {
-                        mailClient.ConnectSsl(GetConfigurationStringValue("MailServerHost", string.Empty), GetConfigurationIntegerValue("MailServerPort"));
-                        mailClient.Login(GetConfigurationStringValue("MailServerUsername", string.Empty), GetConfigurationStringValue("MailServerPassword", string.Empty));
+                        user.MailClient.Disconnect();
                     }
-                    else
+                }
+                users.Clear();
+
+                if (usersFile.CanSeek) usersFile.Position = 0;
+                try
+                {
+                    XmlDocument doc = new XmlDocument();
+                    doc.Load(usersFile);
+                    XmlElement root = doc.DocumentElement;
+                    XmlNodeList userNodes = root.GetElementsByTagName("user");
+                    foreach (XmlNode node in userNodes)
                     {
-                        mailClient.Connect(GetConfigurationStringValue("MailServerHost", string.Empty),
-                                           GetConfigurationIntegerValue("MailServerPort"),
-                                           GetConfigurationStringValue("MailServerUsername", string.Empty),
-                                           GetConfigurationStringValue("MailServerPassword", string.Empty));
+                        string host = node.Attributes["host"]?.Value;
+                        string username = node.Attributes["username"]?.Value;
+                        string password = node.Attributes["password"]?.Value;
+                        if (host == null || username == null || password == null)
+                        {
+                            Logger.Log("A host, username or password field is missing somewhere in the Users.xml file", LogType.WARNING);
+                            continue;
+                        }
+
+                        int port = Default.MailServerPort;
+                        try
+                        {
+                            port = Convert.ToInt32(node.Attributes["port"]?.Value);
+                        }
+                        catch(Exception)
+                        {
+                            Logger.Log($"Invalid value in port field for user {username}. Using default: {Default.MailServerPort}", LogType.WARNING);
+                            port = Default.MailServerPort;
+                        }
+
+                        bool useSSL = Default.UseSSL;
+                        try
+                        {
+                            useSSL = Convert.ToBoolean(node.Attributes["ssl"]?.Value);
+                        }
+                        catch (FormatException)
+                        {
+                            Logger.Log($"Invalid value in ssl field for user {username}. Using default: {Default.UseSSL}", LogType.WARNING);
+                            useSSL = Default.UseSSL;
+                        }
+
+                        User user = new User(host, port, username, password, useSSL);
+                        if (user.Good) users.Add(user);
                     }
+                }
+                catch (XmlException ex)
+                {
+                    Logger.Log($"Error parsing Xml: {ex.Message}", LogType.ERROR);
+                    return;
                 }
             }
             catch (Exception ex)
             {
-                WriteToEventLog("ProcessMailMessages Failed to connect to mail server: " + ex.Message, EventLogEntryType.Error);
+                Logger.Log($"An error occurred while opening the Users.xml file: {ex.Message}", LogType.ERROR);
                 return;
             }
-
-            // select mailbox
-
-            var serverMailboxName = @"INBOX";
-            var serverMailbox = mailClient.SelectMailbox(serverMailboxName);
-            if (serverMailbox == null)
+            finally
             {
-                WriteToEventLog(String.Format("ProcessMailMessages failed to select mailbox by name: {0}", serverMailboxName));
-                return;
-            }
-
-            int[] unreadMessages = null;
-
-            try
-            {
-                unreadMessages = serverMailbox.Search("UNSEEN");
-            }
-            catch
-            {
-                // No other way to catch this error...
-                // No unread e-mails found
-                return;
-            }
-
-            if (unreadMessages == null)
-                return;
-
-            // process messages
-
-            for (int i = 0; i < unreadMessages.Length; i++)
-            {
-                var emailObject = serverMailbox.Fetch.MessageObject(unreadMessages[i]);
-
-                if (emailObject.From.Email.Trim().Length == 0)
-                    continue;
-
-                var emailSubject = emailObject.Subject.Trim();
-                var containsNewTaskTag = emailObject.Subject.Contains(settings.MailImporterTitleNewTag);
-                var taskReferenceNumberIndex = emailSubject.LastIndexOf('#');
-
-                if (taskReferenceNumberIndex == -1 && !containsNewTaskTag)
-                    continue;
-
-                var taskReferenceNumber = 0;
-
-                if (!int.TryParse(emailSubject.Substring(taskReferenceNumberIndex + 1), out taskReferenceNumber) && !containsNewTaskTag)
-                    continue;
-
-                // process message task profile
-                var userProfile = _profileRoutines.GetProfileByName(emailObject.From.Email.Trim());
-
-                if (userProfile == null || userProfile.Context == null || userProfile.Context.Value == 0)
-                    return;
-
-                WriteToEventLog(string.Format("ProcessMailMessages processing message:\n\n{0}", string.IsNullOrWhiteSpace(emailObject.BodyText.Text) ? emailObject.BodyHtml.Text.ParseHTML() : emailObject.BodyText.Text));
-
-                // process message text
-
-                var taskComment = string.Empty;
-                var taskClientName = string.Empty;
-                var taskClientEmail = string.Empty;
-
-                var stringSplitted = Regex.Split(string.IsNullOrWhiteSpace(emailObject.BodyText.Text) ? emailObject.BodyHtml.Text.ParseHTML() : emailObject.BodyText.Text, "\r\n").ToList();
-
-                if (stringSplitted.Select(x => x.Trim()).ToList().Contains(settings.MailImporterMessageSeparator))
-                {
-                    var elemsToRemoveCount = stringSplitted.Count - stringSplitted.Select(x => x.Trim()).ToList().IndexOf(settings.MailImporterMessageSeparator);
-
-                    while (elemsToRemoveCount > 0)
-                    {
-                        elemsToRemoveCount--;
-                        stringSplitted.RemoveAt(stringSplitted.Count - 1);
-                    }
-
-                    for (int j = 0; j < stringSplitted.Count - 1; j++)
-                        taskComment += stringSplitted.ElementAt(j) + "\r\n";
-
-                    taskComment += stringSplitted.ElementAt(stringSplitted.Count - 1);
-                }
-                else
-                    taskComment = string.IsNullOrWhiteSpace(emailObject.BodyText.Text) ? emailObject.BodyHtml.Text.ParseHTML() : emailObject.BodyText.Text;
-
-                // process message attribs for new task
-                if (containsNewTaskTag)
-                {
-                    _taskRoutines.CreateTaskWithNotes
-                        (
-                            Regex.Replace(emailObject.Subject.Replace(settings.MailImporterTitleNewTag, String.Empty), @"\t|\n|\r", "").Trim(),
-                            taskComment,
-                            taskClientName,
-                            taskClientEmail,
-                            userProfile
-                        );
-                } // created task
-                else if (!string.IsNullOrWhiteSpace(taskComment))
-                {
-                    SystemCacheFactory.Method = "FILESYSTEM";
-                    
-                    _commentsRoutines.CreateComentByTaskReference
-                        (
-                            taskReferenceNumber,
-                            emailObject.From.Email.Trim(),
-                            taskComment,
-                            emailObject.Date.ToLocalTime(),
-                            userProfile.Context.Value
-                        );                    
-                }
-            } // for
-        }
-
-        private string GetConfigurationStringValue(string keyName, string defaultValue)
-        {
-            var result = ConfigurationManager.AppSettings[keyName];
-
-            if (result == null)
-            {
-                WriteToEventLog("Configuration key " + keyName + " not found!", EventLogEntryType.Warning);
-            return defaultValue;
-            }
-                else if (result.Length == 0)
-            {
-                WriteToEventLog("Configuration key " + keyName + " is empty!", EventLogEntryType.Warning);
-            return defaultValue;
-            }
-            return result;
-        }
-
-        private int GetConfigurationIntegerValue(string key)
-        {
-            int returnValue = 0;
-
-            switch (key)
-            {
-                case "MailServerPort":
-                    {
-                        if (!int.TryParse(ConfigurationManager.AppSettings[key], out returnValue))
-                        {
-                            WriteToEventLog("Configuration key " + key + " not found! Default in use.", EventLogEntryType.Warning);
-                            return 143;
-                        }
-                        return returnValue;
-                    }
-
-                case "MailServerCheckerInterval":
-                    {
-                        if (!int.TryParse(ConfigurationManager.AppSettings[key], out returnValue))
-                        {
-                            WriteToEventLog("Configuration key " + key + " not found! Default in use", EventLogEntryType.Warning);
-                            return 25000;
-                        }
-                        return returnValue;
-                    }
-
-                case "MailTitleRegexPatternGroupForReferenceNumber":
-                    {
-                        if (!int.TryParse(ConfigurationManager.AppSettings[key], out returnValue))
-                        {
-                            WriteToEventLog("Configuration key " + key + " not found! Default in use", EventLogEntryType.Warning);
-                            return 3;
-                        }
-                        return returnValue;
-                    }
-
-                default:
-                    WriteToEventLog("Configuration key " + key + " not found! No default to use", EventLogEntryType.Warning);
-                    return returnValue;
+                usersFile?.Dispose();
             }
         }
-
 
         protected override void OnStop()
         {
-            if (mailClient != null && mailClient.IsConnected)
+            foreach(User user in users)
             {
-                mailClient.Disconnect();
-            }
+                if(user.MailClient != null && user.MailClient.IsConnected)
+                {
+                    user.MailClient.Disconnect();
+                }
 
-            if (checkerTimer != null)
-            {
-                checkerTimer.Enabled = false;
+                if(checkerTimer != null)
+                {
+                    checkerTimer.Enabled = false;
+                }
             }
         }
     }
